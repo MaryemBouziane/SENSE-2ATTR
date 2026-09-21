@@ -1,0 +1,160 @@
+# SENSE-2ATTR: semantic and speaker distillation on Common Voice.
+
+# Set the seed before instantiating modules with parameters.
+seed: 2422
+__set_seed: !apply:speechbrain.utils.seed_everything
+  - !ref <seed>
+
+############################## Data ####################################
+# Prepare these Common Voice manifests and mono 16 kHz audio before training.
+# Columns: ID, wav, wrd, lang, duration; train.csv also requires ratio.
+train_csv: data/train.csv
+valid_csv: data/dev.csv
+
+output_folder: !ref results/SENSE_joint_layer_mixing/<seed>
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+find_unused_parameters: true
+device: !apply:speechbrain.utils.distributed.infer_device
+
+############################## Semantic teacher: BGE-M3 #################
+# Compute semantic targets from the transcripts.
+bge_path: BAAI/bge-m3
+bge_use_fp16: true
+
+bge_model: !new:speechbrain.integrations.nlp.bgeM3_embeddings.BGEM3SentenceEmbeddings
+  source: !ref <bge_path>
+  use_fp16: !ref <bge_use_fp16>
+  return_dense: true
+  devices: [!ref <device>]
+
+############################## Speaker teacher: ECAPA #########################
+# Frozen ECAPA teacher, called on the audio during training.
+teacher_source: speechbrain/spkrec-ecapa-voxceleb
+teacher_savedir: !ref <save_folder>/ecapa_teacher
+teacher_dim: 192
+
+############################## Speech encoder ##########################
+wav2vec2_hub: facebook/w2v-bert-2.0
+wav2vec2_frozen: false
+
+############################## Training ################################
+number_of_epochs: 10
+batch_size: 20
+num_workers: 2
+batch_size_valid: 20
+num_workers_valid: 2
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+  limit: !ref <number_of_epochs>
+
+dataloader_options:
+  batch_size: !ref <batch_size>
+  num_workers: !ref <num_workers>
+  shuffle: false
+
+valid_dataloader_options:
+  batch_size: !ref <batch_size_valid>
+  num_workers: !ref <num_workers_valid>
+  shuffle: false
+
+############################## Loss ####################################
+# Sum each cosine loss over the batch.
+loss_scale_sem: 50
+loss_scale_spk: 50
+lambda_sem: 1.0
+lambda_spk: 1.0
+
+############################## Architecture ############################
+d_model: 1024
+num_w2v_layers: 25
+
+# Select hidden states 1 through 24.
+layer_start_sem: 1
+layer_end_sem: 25
+layer_start_spk: 1
+layer_end_spk: 25
+
+wav2vec2: !new:speechbrain.integrations.huggingface.w2v_bert.W2VBert
+  source: !ref <wav2vec2_hub>
+  save_path: !ref <save_folder>/wav2vec2_checkpoint
+  freeze: !ref <wav2vec2_frozen>
+  output_all_hiddens: true
+
+# Independent per-layer projections and learned weights.
+layer_mix_sem: !new:layer_mixing.LayerLinearProjectMix
+  num_layers: !ref <num_w2v_layers>
+  d_model: !ref <d_model>
+  layer_start: !ref <layer_start_sem>
+  layer_end: !ref <layer_end_sem>
+  use_layernorm: true
+  init_identity: true
+
+layer_mix_spk: !new:layer_mixing.LayerLinearProjectMix
+  num_layers: !ref <num_w2v_layers>
+  d_model: !ref <d_model>
+  layer_start: !ref <layer_start_spk>
+  layer_end: !ref <layer_end_spk>
+  use_layernorm: true
+  init_identity: true
+
+attn_pooling_sem: !new:speechbrain.nnet.pooling.AttentionPooling
+  input_dim: !ref <d_model>
+
+attn_pooling_spk: !new:speechbrain.nnet.pooling.AttentionPooling
+  input_dim: !ref <d_model>
+
+projection_spk: !new:torch.nn.Linear
+  in_features: !ref <d_model>
+  out_features: !ref <teacher_dim>
+  bias: true
+
+modules:
+  wav2vec2: !ref <wav2vec2>
+  bge_model: !ref <bge_model>
+  layer_mix_sem: !ref <layer_mix_sem>
+  layer_mix_spk: !ref <layer_mix_spk>
+  attn_pooling_sem: !ref <attn_pooling_sem>
+  attn_pooling_spk: !ref <attn_pooling_spk>
+  projection_spk: !ref <projection_spk>
+
+# Include all trainable mixers and heads in the optimizer and checkpoint.
+model: !new:torch.nn.ModuleList
+  modules: [!ref <layer_mix_sem>, !ref <layer_mix_spk>, !ref <attn_pooling_sem>, !ref <attn_pooling_spk>, !ref <projection_spk>]
+
+############################## Optimizers & schedulers #################
+lr: 1.5
+lr_wav2vec: 0.00001
+
+model_opt_class: !name:torch.optim.Adadelta
+  lr: !ref <lr>
+  rho: 0.95
+  eps: 0.00000001
+
+wav2vec_opt_class: !name:torch.optim.Adam
+  lr: !ref <lr_wav2vec>
+
+lr_annealing_model: !new:speechbrain.nnet.schedulers.NewBobScheduler
+  initial_value: !ref <lr>
+  improvement_threshold: 0.0025
+  annealing_factor: 0.5
+  patient: 2
+
+lr_annealing_wav2vec: !new:speechbrain.nnet.schedulers.NewBobScheduler
+  initial_value: !ref <lr_wav2vec>
+  improvement_threshold: 0.0025
+  annealing_factor: 0.9
+
+############################## Checkpointer & logger ###################
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+  checkpoints_dir: !ref <save_folder>
+  recoverables:
+    model: !ref <model>
+    wav2vec2: !ref <wav2vec2>
+    lr_annealing_model: !ref <lr_annealing_model>
+    lr_annealing_wav2vec: !ref <lr_annealing_wav2vec>
+    counter: !ref <epoch_counter>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+  save_file: !ref <train_log>
